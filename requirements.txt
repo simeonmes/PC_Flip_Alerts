@@ -1,0 +1,8 @@
+playwright
+requests
+beautifulsoup4
+twilio
+python-dotenv
+discord.py
+anthropic
+praw

@@ -1,0 +1,30 @@
+{
+  "updated_at": "2026-10-04",
+  "_source_notes": "Assisted refresh pass. RAM/Storage: strong multi-source signal that the memory/NAND shortage worsened further since the July 12 seed refresh (DDR5 new ~$13.41-17.50/GB per TweakTown/Tom's Hardware/tech-insider.org, up from ~$11.5/GB in July; DDR4 new ~$7.77/GB; NAND flash 'doubled in six months' per TweakTown/Tom's Hardware citing Phison/TrendForce). GPU entries below are a spot-check of the highest-traffic SKUs in this bot's own alert history (bestvaluegpu.com point-in-time Oct 2026 figures, cross-checked against pcprice.watch/tech-insider.org trend pieces) -- NOT an exhaustive re-check of the full ~140-entry GPU table or the CPU/motherboard/PSU/cooler tables, which carry forward the July values unchanged since no fresh evidence surfaced that those moved further.",
+  "RAM": {
+    "ddr5_per_gb": 12.0,
+    "ddr4_per_gb": 6.2,
+    "default_per_gb": 4.5
+  },
+  "STORAGE_VALUES": {
+    "4tb nvme": 645,
+    "2tb nvme": 315,
+    "1tb nvme": 165,
+    "512gb nvme": 90,
+    "256gb nvme": 57,
+    "4tb ssd": 450,
+    "2tb ssd": 230,
+    "1tb ssd": 125,
+    "512gb ssd": 70,
+    "256gb ssd": 40,
+    "nvme": 125,
+    "ssd": 80
+  },
+  "GPU_VALUES": {
+    "rtx 5070": 650,
+    "rtx 4070": 600,
+    "rtx 3080 ti": 500,
+    "rx 9070": 650,
+    "rtx 4090": 2400
+  }
+}

@@ -1,0 +1,22 @@
+# Secrets — never commit
+.env
+
+# Virtual environments (machine-specific, large)
+venv/
+venv_old_store_python/
+
+# Python / IDE / Claude local state
+__pycache__/
+*.pyc
+.idea/
+.claude/
+
+# Runtime state and alert history (generated, contains listing data)
+seen_listings.json
+cooldown_cache.json
+digest_cache.json
+scan_stats.json
+discord_alert_history.json
+discord_alert_history.csv
+discord_alert_flagged.json
+audit_debug_out.txt
