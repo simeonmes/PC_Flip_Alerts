@@ -519,18 +519,13 @@ def _normalize_listing(raw: dict) -> dict:
 # "NO GPU" notes and the real title live on each item page, so candidates get
 # opened individually. Capped per query so a scan doesn't open dozens of pages.
 _MAX_DETAIL_FETCHES_PER_QUERY = 20
-_GENERIC_TITLES = {"", "no title", "partner listing", "listing", "gaming pc", "desktop"}
-
-
-def _is_generic_title(title: str) -> bool:
-    """True when the card title is a placeholder or too short to identify a card."""
-    t = (title or "").strip().lower()
-    return t in _GENERIC_TITLES or len(t) < 10
-
-
 def _needs_detail_fetch(listing: dict) -> bool:
-    """A listing needs its item page when the card lacked a body or a usable title."""
-    return not listing.get("description") or _is_generic_title(listing.get("title", ""))
+    """
+    Every candidate gets its item page. Card text is unreliable: it can be a
+    body-less title, a menu label, or page chrome that isn't the listing at
+    all, and a non-empty card body used to skip the fetch entirely.
+    """
+    return True
 
 
 def _fetch_listing_details(context, url: str) -> dict:
@@ -665,7 +660,8 @@ def fetch_facebook_listings(search_query: str, zip_code: str = None,
                     continue
                 detail_budget -= 1
                 details = _fetch_listing_details(context, listing["url"])
-                if details.get("title") and _is_generic_title(listing["title"]):
+                # The item page replaces the card's text outright when it loads.
+                if details.get("title"):
                     listing["title"] = details["title"]
                 if details.get("description"):
                     listing["description"] = details["description"]

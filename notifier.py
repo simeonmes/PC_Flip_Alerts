@@ -1266,6 +1266,17 @@ def notify(listing: dict, score_data: dict) -> bool:
     # (one ambiguous signal shouldn't kill a real deal outright) but takes a
     # score penalty so it needs to be stronger elsewhere to still clear the
     # alert threshold.
+    # Plausibility guard, independent of the AI check: a full-system value
+    # several times the asking price means the scorer summed parts that aren't
+    # for sale (stray page text, a sidebar listing) — e.g. a $22 card valued at
+    # $3,000+. Real full-system deals sit around 1.5-2.5x.
+    _ask = float(listing.get("price", 0) or 0)
+    _est = float(score_data.get("estimated_value", 0) or 0)
+    if listing.get("category_override") == "Full Systems" and _est > 4 * max(_ask, 1.0):
+        print(f"   🚫 Holding alert — full-system value ${_est:.0f} is over 4x the ${_ask:.0f} ask: "
+              f"{listing.get('title','')[:40]}")
+        return False
+
     scam_data = None
     if ANTHROPIC_API_KEY:
         try:
