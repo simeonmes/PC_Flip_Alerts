@@ -243,6 +243,18 @@ AI_VAGUE_TRIAGE_PRICE_MIN      = float(os.getenv("AI_VAGUE_TRIAGE_PRICE_MIN", "3
 AI_VAGUE_TRIAGE_PRICE_MAX      = float(os.getenv("AI_VAGUE_TRIAGE_PRICE_MAX", "1200"))
 AI_VAGUE_TRIAGE_MAX_PER_CYCLE  = int(os.getenv("AI_VAGUE_TRIAGE_MAX_PER_CYCLE", "25"))
 
+# Shadow mode (listing_extractor.py): Haiku reads each listing into structured
+# parts, the price book values them, and a margin rule decides — logged next
+# to the live scorer's verdict without affecting any alert. Each listing is
+# read once (cached), ~$2 per 1,000 listings measured. The per-cycle cap only
+# matters on a cold cache: a backlog is spread over the next few cycles.
+SHADOW_EXTRACTION_ENABLED             = os.getenv("SHADOW_EXTRACTION_ENABLED", "true").lower() == "true"
+SHADOW_EXTRACTION_MAX_CALLS_PER_CYCLE = int(os.getenv("SHADOW_EXTRACTION_MAX_CALLS_PER_CYCLE", "80"))
+# The rule that matched the hand-labelled scoreboard best: deals labelled
+# "alert" sat at 22-35% margin, every "skip" at 13% or less.
+SHADOW_MIN_MARGIN                     = float(os.getenv("SHADOW_MIN_MARGIN", "0.20"))
+SHADOW_MIN_PROFIT_USD                 = float(os.getenv("SHADOW_MIN_PROFIT_USD", "50"))
+
 
 # ---------------------------------------------------------------------------
 # 9. MULTI-REGION (Tier 2 infrastructure)

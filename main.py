@@ -19,6 +19,7 @@ sys.stderr.reconfigure(encoding="utf-8")
 import stats as bot_stats
 import heartbeat
 import scan_state
+import listing_extractor
 
 from config import (
     SEARCH_QUERIES, MAX_PRICE_USD, MIN_PRICE_USD,
@@ -240,6 +241,7 @@ def run_scan_cycle():
     print(f"\n📦 {len(listings)} unique listings within price cap (${MAX_PRICE_USD:.0f}).\n")
 
     reset_vague_triage_budget()
+    listing_extractor.begin_cycle()
     alert_count = 0
     gpu_count   = 0
 
@@ -266,6 +268,13 @@ def run_scan_cycle():
 
         print(f"  [{platform_label:<16}] {title[:40].ljust(40)} | ${price:<6.0f} | {total_score:>5.1f}/100")
         print(f"  {'':18}🔗 {url}")
+
+        # Shadow mode: Haiku reads the same listing and its verdict is logged
+        # next to this one. Purely observational — nothing below depends on it.
+        try:
+            listing_extractor.shadow_check(listing, score_data, passes_alert_gate(listing, score_data))
+        except Exception as e:
+            print(f"⚠️  Shadow extraction error: {e}")
         print("-" * 90)
 
         # ── Vague lead capture ────────────────────────────────────────────────
@@ -330,6 +339,7 @@ def run_scan_cycle():
     heartbeat.send_if_due()
 
     log_vague_triage_cycle_summary()
+    listing_extractor.cycle_summary()
 
     print(f"\n✅ Scan complete. {alert_count} new alert(s) sent.\n")
 

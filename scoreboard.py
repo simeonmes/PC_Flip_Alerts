@@ -11,15 +11,18 @@ watch the next few live alerts — which is mostly luck, and never shows the
 listings a change quietly broke. With it, a change either moves the number
 or it doesn't, and anything that flips from right to wrong is named.
 
-Offline and read-only against the outside world: no scraping, no Discord,
-no AI calls. It measures the deterministic scorer + gate only — the AI
-photo/scam checks in notifier.py run after this point and can still hold an
-alert the scorer let through.
+A plain run is offline: no scraping, no Discord, no AI calls. It measures
+the deterministic scorer + gate — the AI photo/scam checks in notifier.py
+run after this point and can still hold an alert the scorer let through —
+and, for every labelled listing Haiku has already read, the shadow-mode
+approach (listing_extractor.py) side by side on the same listings.
 
 Usage:
     python scoreboard.py                  # score every labelled listing
     python scoreboard.py label            # label the unlabelled ones (y/n)
     python scoreboard.py add <fb url>     # add a listing the scanner has read
+    python scoreboard.py shadow           # import listings shadow mode or the bot would alert on
+    python scoreboard.py extract          # have Haiku read labelled listings it hasn't yet (~$0.002 each)
 """
 
 import json
@@ -32,6 +35,7 @@ from pathlib import Path
 # also applies the stdout UTF-8 fix this script needs for the same reason.
 from main import passes_alert_gate
 
+import listing_extractor
 from config import MAX_PRICE_USD, MIN_PRICE_USD
 from facebook_scraper import detect_description_bundle_price, _DETAIL_CACHE_PATH
 from scoring import calculate_deal_score, is_junk_category_listing
@@ -55,6 +59,16 @@ def _save_cases(cases: list) -> None:
         json.dump(cases, f, indent=2, ensure_ascii=False)
 
 
+def _dropped_reason(case: dict) -> str:
+    """Why main.run_scan_cycle() would drop this before any scoring, or ""."""
+    price = float(case.get("price", 0) or 0)
+    if is_junk_category_listing(case.get("title", "")):
+        return "dropped: junk-category title"
+    if not (MIN_PRICE_USD <= price <= MAX_PRICE_USD):
+        return f"dropped: price ${price:.0f} outside ${MIN_PRICE_USD:.0f}-${MAX_PRICE_USD:.0f}"
+    return ""
+
+
 def _verdict(case: dict) -> dict:
     """
     Runs one case through the same steps as main.run_scan_cycle(): junk-title
@@ -64,10 +78,9 @@ def _verdict(case: dict) -> dict:
     desc  = case.get("description", "")
     price = float(case.get("price", 0) or 0)
 
-    if is_junk_category_listing(title):
-        return {"alert": False, "why": "dropped: junk-category title"}
-    if not (MIN_PRICE_USD <= price <= MAX_PRICE_USD):
-        return {"alert": False, "why": f"dropped: price ${price:.0f} outside ${MIN_PRICE_USD:.0f}-${MAX_PRICE_USD:.0f}"}
+    dropped = _dropped_reason(case)
+    if dropped:
+        return {"alert": False, "why": dropped}
 
     listing = {
         "title":                    title,
@@ -87,6 +100,69 @@ def _verdict(case: dict) -> dict:
                      f"| {listing.get('category_override') or 'no category'}"),
         "parts":    parts,
     }
+
+
+def _as_listing(case: dict) -> dict:
+    return {
+        "platform":    case.get("platform", "Facebook"),
+        "listing_id":  case["id"],
+        "url":         case.get("url", ""),
+        "title":       case.get("title", ""),
+        "description": case.get("description", ""),
+        "price":       float(case.get("price", 0) or 0),
+    }
+
+
+def _shadow_verdict(case: dict):
+    """
+    The shadow approach's verdict from Haiku's cached reading of this
+    listing, or None if Haiku hasn't read it (see the `extract` command).
+    """
+    if _dropped_reason(case):
+        return {"alert": False, "reason": "dropped before scoring"}
+    extraction = listing_extractor.extract_cached(_as_listing(case), allow_call=False)
+    if extraction is None:
+        return None
+    return listing_extractor.verdict(extraction, float(case.get("price", 0) or 0))
+
+
+def _print_shadow_comparison(labelled: list) -> None:
+    """Current bot vs shadow mode, on exactly the same listings."""
+    read = [(c, _shadow_verdict(c)) for c in labelled]
+    read = [(c, v) for c, v in read if v is not None]
+    if not read:
+        print("\n🕵️  Haiku hasn't read any of these yet — run:  python scoreboard.py extract")
+        return
+
+    def line(name, pairs):
+        good  = [c for c, _ in pairs if c["label"] == "alert"]
+        bad   = [c for c, _ in pairs if c["label"] == "skip"]
+        cur_c = sum(_verdict(c)["alert"] for c in good)
+        cur_f = sum(_verdict(c)["alert"] for c in bad)
+        sh_c  = sum(v["alert"] for c, v in pairs if c["label"] == "alert")
+        sh_f  = sum(v["alert"] for c, v in pairs if c["label"] == "skip")
+        print(f"  {name:<34} {len(pairs):>3} listings | good deals caught — current {cur_c}/{len(good)}, "
+              f"Haiku {sh_c}/{len(good)} | false alerts — current {cur_f}, Haiku {sh_f}")
+
+    print(f"\n🕵️  CURRENT BOT vs HAIKU SHADOW MODE "
+          f"(margin ≥ {listing_extractor.SHADOW_MIN_MARGIN:.0%}, profit ≥ ${listing_extractor.SHADOW_MIN_PROFIT_USD:.0f})")
+    line("all labelled listings Haiku read", read)
+    unseen = [(c, v) for c, v in read if c.get("source") == "shadow"]
+    if unseen:
+        line("new listings from shadow mode", unseen)
+    else:
+        print("  (no shadow-mode listings labelled yet — the result that counts; see `shadow`)")
+    if len(read) < len(labelled):
+        print(f"  {len(labelled) - len(read)} labelled listing(s) not read by Haiku yet — run:  python scoreboard.py extract")
+
+    disagree = [(c, v) for c, v in read if v["alert"] != _verdict(c)["alert"]]
+    if disagree:
+        print("  Where they disagree:")
+        for c, v in disagree:
+            right = "Haiku" if v["alert"] == (c["label"] == "alert") else "current"
+            print(f"   • [{right} right] ${c['price']:.0f}  {c['title'][:60]}")
+            print(f"       Haiku: {'ALERT' if v['alert'] else 'skip'} — {v['reason']}"
+                  + (f" | est ${v['est']:.0f}, margin {v['margin']:.0%}" if v.get("est") else ""))
 
 
 def _print_case(case: dict, verdict: dict) -> None:
@@ -142,6 +218,8 @@ def run() -> None:
         print(f"\n❌ FALSE ALERTS — you said skip, the bot would alert ({len(false_alerts)}):")
         for case, verdict in false_alerts:
             _print_case(case, verdict)
+
+    _print_shadow_comparison(labelled)
 
     # ── What changed since the previous run ──────────────────────────────────
     try:
@@ -243,12 +321,80 @@ def add(ref: str) -> None:
     print(f"✅ Added '{entry.get('title', '')[:60]}'. Label it with:  python scoreboard.py label")
 
 
+def import_shadow() -> None:
+    """
+    Pulls listings from shadow_log.jsonl into the set, unlabelled: every one
+    the current bot OR Haiku would alert on (latest record per listing). The
+    disagreements decide which approach is better; the agreed alerts check
+    that neither is alerting on junk. These listings were never used to tune
+    either approach, so they're the fair test.
+    """
+    if not listing_extractor.SHADOW_LOG_PATH.exists():
+        print("ℹ️  No shadow log yet — run the scanner for a cycle or two first.")
+        return
+    latest = {}
+    with open(listing_extractor.SHADOW_LOG_PATH, encoding="utf-8") as f:
+        for line in f:
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            latest[rec["key"]] = rec
+
+    cases    = _load_cases()
+    existing = {c["id"] for c in cases}
+    added = {"disagree": 0, "both": 0}
+    for rec in latest.values():
+        cur, sh = rec["current"]["alert"], rec["haiku"]["alert"]
+        if not (cur or sh):
+            continue
+        case_id = str(rec.get("listing_id") or rec["key"])
+        if case_id in existing:
+            continue
+        cases.append({
+            "id":          case_id,
+            "url":         rec.get("url", ""),
+            "platform":    rec.get("platform") or "Facebook",
+            "title":       rec.get("title", ""),
+            "description": rec.get("description", ""),
+            "price":       rec.get("price", 0),
+            "label":       None,
+            "note":        "",
+            "source":      "shadow",
+        })
+        existing.add(case_id)
+        added["disagree" if cur != sh else "both"] += 1
+    _save_cases(cases)
+    total = added["disagree"] + added["both"]
+    print(f"✅ Added {total} listing(s) from shadow mode: {added['disagree']} where the two disagree, "
+          f"{added['both']} both would alert on.")
+    if total:
+        print("   Label them with:  python scoreboard.py label")
+
+
+def extract_missing() -> None:
+    """Has Haiku read every labelled listing it hasn't yet, so `run` can compare both approaches."""
+    cases   = _load_cases()
+    pending = [c for c in cases if c.get("label") in ("alert", "skip", "unsure")
+               and listing_extractor.extract_cached(_as_listing(c), allow_call=False) is None]
+    if not pending:
+        print("✅ Haiku has already read every labelled listing.")
+        return
+    print(f"Reading {len(pending)} listing(s) with Haiku (about ${len(pending) * 0.0022:.2f})...")
+    done = sum(listing_extractor.extract_cached(_as_listing(c)) is not None for c in pending)
+    print(f"✅ {done}/{len(pending)} read. Run:  python scoreboard.py")
+
+
 if __name__ == "__main__":
     command = sys.argv[1] if len(sys.argv) > 1 else "run"
     if command == "label":
         label()
     elif command == "add" and len(sys.argv) > 2:
         add(sys.argv[2])
+    elif command == "shadow":
+        import_shadow()
+    elif command == "extract":
+        extract_missing()
     elif command == "run":
         run()
     else:
