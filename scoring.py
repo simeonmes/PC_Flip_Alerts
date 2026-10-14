@@ -138,7 +138,7 @@ def _expand_amd_shorthand(text: str, price: float = 0.0) -> str:
     """
     Expands bare AMD Radeon numbers to full names, mirroring
     _expand_gpu_shorthand() but for AMD's numbering scheme. Skips numbers
-    already prefixed with 'rx'/'radeon', applies a RAM-speed collision
+    already prefixed with 'rx', applies a RAM-speed collision
     guard for numbers that also appear as common DDR4/DDR5 speeds, skips
     the number if it matches the listing's own asking price (e.g. "$580
     firm" colliding with "rx 580"), and skips numbers immediately preceded
@@ -156,8 +156,11 @@ def _expand_amd_shorthand(text: str, price: float = 0.0) -> str:
         if price_int is not None and int(num) == price_int:
             return m.group(0)
 
+        # Only an existing "rx" means it's already in GPU_VALUES' key form.
+        # "radeon" alone used to count too, which left "Radeon 7800XT" as
+        # "radeon 7800 xt" — matching no key, so the card went undetected.
         preceding_short = text[max(0, start - 8):start].lower()
-        if "rx" in preceding_short or "radeon" in preceding_short:
+        if "rx" in preceding_short:
             return m.group(0)
 
         preceding_cpu = text[max(0, start - 16):start].lower()
@@ -190,6 +193,23 @@ _PRIOR_OWNERSHIP_PHRASES = [
     "had a", "replaced my", "replaced with", "used with my old",
     "old card", "my old", "sold my old", "no longer need",
 ]
+
+
+# A GPU named right after one of these is the card the seller moved ON to (or
+# wants in exchange), not the one for sale: "upgraded to a 5070", "want to
+# trade up to a 5070ti". Seen in production: a 5060 Ti listing valued as the
+# 5070 Ti its seller wanted, and a 7800 XT valued as the 5070 that replaced it.
+_NOT_FOR_SALE_LEADIN_PHRASES = [
+    "upgraded to", "upgrading to", "upgrade to", "trade up to", "trade for",
+    "trading for", "swap for", "switched to", "moved to", "replaced it with",
+    "looking for",
+]
+_NOT_FOR_SALE_LEADIN_WINDOW = 30   # chars before the GPU name — room for "a brand new msi "
+
+
+def _is_not_for_sale_mention(text_lower: str, pos: int) -> bool:
+    window = text_lower[max(0, pos - _NOT_FOR_SALE_LEADIN_WINDOW):pos]
+    return any(phrase in window for phrase in _NOT_FOR_SALE_LEADIN_PHRASES)
 
 
 def _find_gpu_candidates(text_lower: str) -> list:
@@ -249,7 +269,13 @@ def _select_best_gpu_match(text_lower: str, price: float = 0.0):
     With only one GPU mentioned, that's returned directly — the
     disambiguation logic only matters when there's more than one candidate.
     """
-    candidates = _find_gpu_candidates(text_lower)
+    # Cards the seller upgraded to / wants in trade are never the item for
+    # sale — dropped outright, even when that leaves no GPU at all. No GPU
+    # is the right answer for a listing that only names its replacement.
+    candidates = [
+        c for c in _find_gpu_candidates(text_lower)
+        if not _is_not_for_sale_mention(text_lower, c[1])
+    ]
     if not candidates:
         return None
     if len(candidates) == 1:
@@ -285,9 +311,8 @@ _LAPTOP_GPU_SIGNALS = [
 # Specific laptop chassis names that never appear on desktop products
 _LAPTOP_CHASSIS_SIGNALS = [
     "razer blade",
-    "lenovo legion", "lenovo ideapad gaming",
+    "lenovo ideapad gaming",
     "acer nitro 5", "acer predator helios",
-    "hp omen", "hp victus",
     "dell g15", "dell g16", "dell g17",
     "asus rog zephyrus", "asus tuf f15", "asus tuf f17", "asus tuf gaming a15",
     "msi stealth", "msi katana",
@@ -295,6 +320,13 @@ _LAPTOP_CHASSIS_SIGNALS = [
     "alienware 15", "alienware 17", "alienware m15", "alienware m17",
     "alienware x14", "alienware x15", "alienware x17",
 ]
+
+# Brand lines sold as BOTH laptops and desktops (HP Omen 30L, Victus 15L,
+# Legion Tower). These used to count as laptop proof on their own, which
+# capped a $400 HP OMEN 30L Desktop at 45 and halved its profit. They only
+# count when nothing in the text says desktop.
+_LAPTOP_OR_DESKTOP_BRAND_SIGNALS = ["hp omen", "hp victus", "lenovo legion"]
+_DESKTOP_SIGNALS = ["desktop", "tower", "gaming pc", "15l", "25l", "30l", "40l", "45l"]
 
 # Mobile CPU suffix regex — Intel/AMD mobile processors end in HK/HQ/HX/H/U/HS
 # e.g. i7-6820HK, i9-12900HX, Ryzen 7 5800H, i5-8250U
@@ -305,6 +337,7 @@ _TRADE_SIGNALS = [
     "trade only", "trades only", "open to trades", "willing to trade",
     "looking to trade", "want to trade", "swap for", "swap only",
     "wtt ",   # "Want To Trade" abbreviation common on marketplace
+    "for trade", "trade up",
 ]
 
 
@@ -319,6 +352,9 @@ def _is_laptop_listing(text_lower: str) -> bool:
     if any(sig in text_lower for sig in _LAPTOP_SIGNALS + _LAPTOP_GPU_SIGNALS):
         return True
     if any(sig in text_lower for sig in _LAPTOP_CHASSIS_SIGNALS):
+        return True
+    if (any(sig in text_lower for sig in _LAPTOP_OR_DESKTOP_BRAND_SIGNALS)
+            and not any(sig in text_lower for sig in _DESKTOP_SIGNALS)):
         return True
     if _MOBILE_CPU_RE.search(text_lower):
         return True
@@ -540,6 +576,9 @@ _SHIPPING_ONLY_HARD_SIGNALS = [
     "will ship", "can ship", "i can ship", "i will ship", "able to ship",
     "happy to ship", "shipping available", "will only ship",
     "ship it to you", "ship anywhere", "i only ship",
+    # eBay listings Facebook syndicates into Marketplace search results —
+    # shipped from wherever the eBay seller is, never a local pickup.
+    "see item on ebay", "buy now on ebay", "ebay money back guarantee",
 ]
 
 _LOCAL_PICKUP_POSITIVE_SIGNALS = [
@@ -661,6 +700,23 @@ def _extract_ram_gb(text_lower: str):
             continue
         return m
     return None
+
+
+# ---------------------------------------------------------------------------
+# Specific-before-generic key ordering for motherboards and coolers.
+# Plain longest-match-first put the catch-all words ahead of the real model
+# keys just because they're longer strings: "motherboard" (11 chars, $80)
+# beat "z790" (4 chars, $205), so naming the part cost a listing its value.
+# ---------------------------------------------------------------------------
+_GENERIC_MOTHERBOARD_KEYS = {"motherboard", "mobo"}
+_GENERIC_COOLER_KEYS = {
+    "liquid cooled", "liquid cooling", "water cooled", "aio cooler", "cpu cooler",
+}
+
+
+def _specific_first(keys, generic_keys) -> list:
+    """Longest match first, with every catch-all key after every specific one."""
+    return sorted(keys, key=lambda k: (k in generic_keys, -len(k)))
 
 
 # ---------------------------------------------------------------------------
@@ -843,7 +899,7 @@ def score_part_quality_and_valuation(text: str, price: float = 0.0, max_points: 
             break
 
     # ── Motherboard detection ────────────────────────────────────────────────
-    for mobo_kw in sorted(MOTHERBOARD_VALUES, key=len, reverse=True):
+    for mobo_kw in _specific_first(MOTHERBOARD_VALUES, _GENERIC_MOTHERBOARD_KEYS):
         if mobo_kw in text_lower:
             mobo_val = MOTHERBOARD_VALUES[mobo_kw]
             # Only add value if we're not in a standalone GPU listing
@@ -863,7 +919,7 @@ def score_part_quality_and_valuation(text: str, price: float = 0.0, max_points: 
                 break
 
     # ── Cooler detection ─────────────────────────────────────────────────────
-    for cooler_kw in sorted(COOLER_VALUES, key=len, reverse=True):
+    for cooler_kw in _specific_first(COOLER_VALUES, _GENERIC_COOLER_KEYS):
         idx = text_lower.find(cooler_kw)
         if idx != -1 and _has_cooler_context(text_lower, cooler_kw, idx):
             cooler_val = COOLER_VALUES[cooler_kw]
@@ -1126,7 +1182,7 @@ def extract_specs_and_value(title: str, description: str, price: float = 0.0) ->
             break
 
     # Motherboard
-    for mobo_kw in sorted(MOTHERBOARD_VALUES, key=len, reverse=True):
+    for mobo_kw in _specific_first(MOTHERBOARD_VALUES, _GENERIC_MOTHERBOARD_KEYS):
         if mobo_kw in combined_text:
             mobo_val = MOTHERBOARD_VALUES[mobo_kw]
             estimated_value += mobo_val
@@ -1144,7 +1200,7 @@ def extract_specs_and_value(title: str, description: str, price: float = 0.0) ->
                 break
 
     # Cooler
-    for cooler_kw in sorted(COOLER_VALUES, key=len, reverse=True):
+    for cooler_kw in _specific_first(COOLER_VALUES, _GENERIC_COOLER_KEYS):
         idx = combined_text.find(cooler_kw)
         if idx != -1 and _has_cooler_context(combined_text, cooler_kw, idx):
             cooler_val = COOLER_VALUES[cooler_kw]

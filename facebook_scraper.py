@@ -25,6 +25,7 @@ seen-listings cache) and description-based bundle/combo price detection
 (feeds scoring.py's placeholder-price override).
 """
 
+import json
 import random
 import re
 import time
@@ -32,7 +33,10 @@ from pathlib import Path
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
-from config import MAX_PRICE_USD, SEARCH_RADIUS_MILES, ZIP_CODE
+from config import (
+    MAX_PRICE_USD, MIN_PRICE_USD, SEARCH_RADIUS_MILES, ZIP_CODE,
+    FB_DETAIL_FETCHES_PER_CYCLE,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -115,7 +119,9 @@ def close_browser_session() -> None:
     Called by main.py's collect_all_listings() finally block so the
     browser is fully torn down once per cycle, not once per query.
     """
-    global _playwright_instance, _shared_context
+    global _playwright_instance, _shared_context, _cycle_detail_fetches
+    # End of the scan cycle — the per-cycle item-page budget starts over.
+    _cycle_detail_fetches = 0
     if _shared_context is not None:
         try:
             _shared_context.close()
@@ -519,13 +525,163 @@ def _normalize_listing(raw: dict) -> dict:
 # "NO GPU" notes and the real title live on each item page, so candidates get
 # opened individually. Capped per query so a scan doesn't open dozens of pages.
 _MAX_DETAIL_FETCHES_PER_QUERY = 20
+
+
 def _needs_detail_fetch(listing: dict) -> bool:
     """
-    Every candidate gets its item page. Card text is unreliable: it can be a
-    body-less title, a menu label, or page chrome that isn't the listing at
-    all, and a non-empty card body used to skip the fetch entirely.
+    Every candidate main.py would actually score gets its item page. Card
+    text is unreliable: it can be a body-less title, a menu label, or page
+    chrome that isn't the listing at all, and a non-empty card body used to
+    skip the fetch entirely.
+
+    The only listings skipped are ones main.py drops before scoring no matter
+    what their page says — a junk-category title (drop_junk_categories) or a
+    price under the parse-failure floor (filter_by_price_cap). Opening those
+    pages bought nothing. Deliberately NOT skipped on "the title's parts
+    can't be worth this price": titles under-describe full systems, which is
+    the whole reason the page gets opened.
     """
+    if 0 < listing.get("price", 0) < MIN_PRICE_USD:
+        return False
+    from scoring import is_junk_category_listing  # lazy: scoring isn't needed to import this module
+    if is_junk_category_listing(listing.get("title", "")):
+        return False
     return True
+
+
+# ---------------------------------------------------------------------------
+# Item-page detail cache
+# ---------------------------------------------------------------------------
+# A listing's own page only needs opening once. Without this, every cycle
+# re-opened the same item pages it had read 15 minutes earlier, and opened
+# one listing again for each overlapping query that returned it ("gaming
+# pc", "gaming desktop", "gaming computer") — up to 20 pages per query, every
+# query, every cycle. That was most of a cycle's runtime and most of the
+# automated page loads Facebook sees from this account.
+# Same ~/.pc_flip_scanner/ convention as PLAYWRIGHT_PROFILE_DIR.
+_DETAIL_CACHE_PATH    = Path.home() / ".pc_flip_scanner" / "fb_detail_cache.json"
+_DETAIL_CACHE_TTL_SEC = 14 * 24 * 60 * 60
+# A page that loaded but yielded no description (layout drift, slow render)
+# is worth another look — just not every cycle.
+_DETAIL_CACHE_EMPTY_RETRY_SEC = 24 * 60 * 60
+
+_detail_cache         = None   # {listing_id: {ts, price, title, description}}, loaded lazily
+_cycle_detail_fetches = 0      # item pages opened so far this scan cycle
+
+
+def _load_detail_cache() -> dict:
+    global _detail_cache
+    if _detail_cache is None:
+        try:
+            with open(_DETAIL_CACHE_PATH, encoding="utf-8") as f:
+                _detail_cache = json.load(f)
+        except Exception:
+            _detail_cache = {}
+    return _detail_cache
+
+
+def _save_detail_cache() -> None:
+    global _detail_cache
+    cutoff = time.time() - _DETAIL_CACHE_TTL_SEC
+    _detail_cache = {
+        k: v for k, v in _load_detail_cache().items()
+        if isinstance(v, dict) and v.get("ts", 0) >= cutoff
+    }
+    try:
+        _DETAIL_CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(_DETAIL_CACHE_PATH, "w", encoding="utf-8") as f:
+            json.dump(_detail_cache, f)
+    except Exception as exc:
+        print(f"⚠️  Could not write fb_detail_cache.json: {exc}")
+
+
+def _detail_cache_key(listing: dict) -> str:
+    return listing.get("listing_id") or listing.get("url") or ""
+
+
+def _cached_details(listing: dict):
+    """
+    Returns the stored item-page details for this listing, or None if its
+    page needs (re)opening: never read, expired, read without a description
+    more than a day ago, or the price has changed since — a seller who edits
+    the price has often edited the text too.
+    """
+    entry = _load_detail_cache().get(_detail_cache_key(listing))
+    if not isinstance(entry, dict):
+        return None
+    age = time.time() - entry.get("ts", 0)
+    if age > _DETAIL_CACHE_TTL_SEC:
+        return None
+    if entry.get("price") != listing.get("price"):
+        return None
+    if not entry.get("description") and age > _DETAIL_CACHE_EMPTY_RETRY_SEC:
+        return None
+    return {k: entry[k] for k in ("title", "description") if entry.get(k)}
+
+
+def _store_details(listing: dict, details: dict) -> None:
+    key = _detail_cache_key(listing)
+    if not key:
+        return
+    _load_detail_cache()[key] = {
+        "ts":          time.time(),
+        "price":       listing.get("price"),
+        "title":       details.get("title", ""),
+        "description": details.get("description", ""),
+    }
+
+
+def _apply_details(listing: dict, details: dict) -> None:
+    """The item page replaces the card's text outright when it loads."""
+    if details.get("title"):
+        listing["title"] = details["title"]
+    if details.get("description"):
+        listing["description"] = details["description"]
+        listing["description_bundle_price"] = detect_description_bundle_price(
+            listing["description"]
+        )
+
+
+def _enrich_with_item_pages(context, listings: list) -> None:
+    """
+    Gives each listing its item page's real title and description, in place:
+    from the cache when this listing's page has been read before, otherwise
+    by opening it — up to _MAX_DETAIL_FETCHES_PER_QUERY pages per query and
+    FB_DETAIL_FETCHES_PER_CYCLE per scan cycle. A listing that misses out on
+    both keeps its card text this cycle and is first in line next cycle,
+    since everything ahead of it is cached by then.
+    """
+    global _cycle_detail_fetches
+    opened = reused = 0
+
+    for listing in listings:
+        if not _needs_detail_fetch(listing):
+            continue
+
+        cached = _cached_details(listing)
+        if cached is not None:
+            _apply_details(listing, cached)
+            reused += 1
+            continue
+
+        if (opened >= _MAX_DETAIL_FETCHES_PER_QUERY
+                or _cycle_detail_fetches >= FB_DETAIL_FETCHES_PER_CYCLE):
+            continue
+
+        opened += 1
+        _cycle_detail_fetches += 1
+        details = _fetch_listing_details(context, listing["url"])
+        # {} means the page didn't load (error, login wall) — leave it
+        # uncached so it gets a real attempt next cycle.
+        if details:
+            _store_details(listing, details)
+            _apply_details(listing, details)
+        _human_delay()
+
+    if opened:
+        _save_detail_cache()
+    print(f"   ↳ Opened {opened} item page(s) for details, reused {reused} from cache "
+          f"({_cycle_detail_fetches}/{FB_DETAIL_FETCHES_PER_CYCLE} opened this cycle).")
 
 
 def _fetch_listing_details(context, url: str) -> dict:
@@ -547,9 +703,20 @@ def _fetch_listing_details(context, url: str) -> dict:
         if h1.count():
             details["title"] = (h1.inner_text(timeout=5_000) or "").strip()
         body = page.inner_text("body", timeout=5_000)
-        m = re.search(r"\nDetails\s*\n(.*?)(?:\nListed in|\nRelated searches|$)", body, re.S)
+        # Stop at the location line under the map, or at the "Today's picks"
+        # feed. Without those terminators ("Listed in" isn't on every page)
+        # the capture ran on through the seller's name, join date, ads and
+        # other people's listings — all scored as if the seller had written
+        # them. Seen in production: an RTX 3070 PC priced as the RTX 4080 in
+        # a stranger's $900 listing further down the page.
+        m = re.search(
+            r"\nDetails\s*\n(.*?)"
+            r"(?:\n[^\n]*Location is approximate|\nSeller information|\nToday's picks"
+            r"|\nListed in|\nRelated searches|$)",
+            body, re.S,
+        )
         if m:
-            details["description"] = " ".join(m.group(1).split())
+            details["description"] = " ".join(m.group(1).split()).rstrip(" ·")
         return details
     except Exception as exc:
         print(f"   ⚠️  Detail fetch failed for {url}: {exc}")
@@ -650,26 +817,9 @@ def fetch_facebook_listings(search_query: str, zip_code: str = None,
                 seen_urls.add(key)
                 listings.append(normed)
 
-            # Open item pages for listings whose card had no body or a generic
-            # title, so scoring sees the real specs and any "NO GPU" note.
-            detail_budget = _MAX_DETAIL_FETCHES_PER_QUERY
-            for listing in listings:
-                if detail_budget <= 0:
-                    break
-                if not _needs_detail_fetch(listing):
-                    continue
-                detail_budget -= 1
-                details = _fetch_listing_details(context, listing["url"])
-                # The item page replaces the card's text outright when it loads.
-                if details.get("title"):
-                    listing["title"] = details["title"]
-                if details.get("description"):
-                    listing["description"] = details["description"]
-                    listing["description_bundle_price"] = detect_description_bundle_price(
-                        listing["description"]
-                    )
-                _human_delay()
-            print(f"   ↳ Opened {_MAX_DETAIL_FETCHES_PER_QUERY - detail_budget} item page(s) for details.")
+            # Item pages carry the real specs and any "NO GPU" note — read each
+            # listing's once and reuse it on every later query and cycle.
+            _enrich_with_item_pages(context, listings)
 
             print(f"   → {len(listings)} Facebook listings within price cap for '{search_query}'.")
             return listings

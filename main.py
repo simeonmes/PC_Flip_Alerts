@@ -210,6 +210,19 @@ def drop_junk_categories(listings: list) -> list:
     return kept
 
 
+def passes_alert_gate(listing: dict, score_data: dict) -> bool:
+    """
+    The scorer's go/no-go for sending a listing on to notify(): its score
+    clears the threshold for its category AND its predicted profit clears
+    the dollar floor. Pulled out of run_scan_cycle() so scoreboard.py checks
+    listings against the exact same rule the live scan uses.
+    """
+    is_full_system = listing.get("category_override") == "Full Systems"
+    threshold      = FULL_SYSTEM_ALERT_THRESHOLD if is_full_system else DEAL_SCORE_ALERT_THRESHOLD
+    return (score_data.get("total_score", 0) >= threshold
+            and score_data.get("predicted_profit", 0) >= MIN_NET_PROFIT_USD)
+
+
 def run_scan_cycle():
     print("\n" + "=" * 60)
     print("Starting scan cycle across all platforms and regions...")
@@ -236,7 +249,6 @@ def run_scan_cycle():
             continue
 
         total_score      = score_data["total_score"]
-        predicted_profit = score_data.get("predicted_profit", 0)
         title            = listing.get("title", "Unknown")
         price            = listing.get("price", 0.0)
         url              = listing.get("url", "")
@@ -270,10 +282,7 @@ def run_scan_cycle():
             except Exception as e:
                 print(f"❌ Vague lead dispatch error: {e}")
 
-        is_full_system = listing.get("category_override") == "Full Systems"
-        threshold      = FULL_SYSTEM_ALERT_THRESHOLD if is_full_system else DEAL_SCORE_ALERT_THRESHOLD
-
-        if total_score >= threshold and predicted_profit >= MIN_NET_PROFIT_USD:
+        if passes_alert_gate(listing, score_data):
             try:
                 was_sent = notify(listing, score_data)
                 if was_sent:

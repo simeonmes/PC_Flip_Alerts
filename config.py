@@ -189,6 +189,15 @@ CRAIGSLIST_ENABLED   = os.getenv("CRAIGSLIST_ENABLED", "true").lower() == "true"
 # by a cheap title+price prelim score get the extra fetch, per query.
 CRAIGSLIST_DETAIL_FETCH_LIMIT = int(os.getenv("CRAIGSLIST_DETAIL_FETCH_LIMIT", "10"))
 
+# Facebook's equivalent: a hard ceiling on item pages opened across ALL
+# queries in one scan cycle (facebook_scraper.py also keeps its own smaller
+# per-query cap). Item pages are cached per listing, so in steady state only
+# genuinely new listings need opening and this is never reached — it exists
+# to bound the first cycle after a cold cache, which would otherwise open
+# hundreds of pages back to back. Listings left over are picked up on the
+# following cycles.
+FB_DETAIL_FETCHES_PER_CYCLE = int(os.getenv("FB_DETAIL_FETCHES_PER_CYCLE", "60"))
+
 
 # ---------------------------------------------------------------------------
 # 7. OFFERUP (via Apify)
